@@ -2,6 +2,7 @@ package mux
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -68,15 +69,68 @@ func ids(ms []*proto.ProxyMapping) map[string]proto.ProxyMappingUpdateType {
 	return out
 }
 
-func syncAll(h *Hub, name string, ms ...*proto.ProxyMapping) {
-	h.UpstreamConnected(name)
+// syncAll acts as management name with snapshot ms: it syncs now and again
+// on every resync request, like a real upstream reconnecting for a session.
+func syncAll(t *testing.T, h *Hub, name string, ms ...*proto.ProxyMapping) {
+	t.Helper()
+	fakeUpstreamsMu.Lock()
+	set, ok := fakeUpstreams[h]
+	if !ok {
+		set = &upstreamSet{snaps: make(map[string][]*proto.ProxyMapping)}
+		fakeUpstreams[h] = set
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		go set.watch(ctx, h)
+	}
+	fakeUpstreamsMu.Unlock()
+
+	set.mu.Lock()
+	set.snaps[name] = ms
+	set.mu.Unlock()
+	_, gen, _ := h.ProxyInit()
+	resync(h, name, gen, ms)
+}
+
+var (
+	fakeUpstreamsMu sync.Mutex
+	fakeUpstreams   = map[*Hub]*upstreamSet{}
+)
+
+type upstreamSet struct {
+	mu    sync.Mutex
+	snaps map[string][]*proto.ProxyMapping
+}
+
+func (s *upstreamSet) watch(ctx context.Context, h *Hub) {
+	for {
+		_, _, changed := h.ProxyInit()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return
+		}
+		_, gen, _ := h.ProxyInit()
+		s.mu.Lock()
+		snaps := make(map[string][]*proto.ProxyMapping, len(s.snaps))
+		for k, v := range s.snaps {
+			snaps[k] = v
+		}
+		s.mu.Unlock()
+		for name, ms := range snaps {
+			resync(h, name, gen, ms)
+		}
+	}
+}
+
+func resync(h *Hub, name string, gen uint64, ms []*proto.ProxyMapping) {
+	h.UpstreamConnected(name, gen)
 	h.ApplyBatch(name, ms, true)
 }
 
 func TestSnapshotMergesAllManagements(t *testing.T) {
 	h := newTestHub(t, "a", "b")
-	syncAll(h, "a", mapping("s1", "acc-a", "one.example.com"))
-	syncAll(h, "b", mapping("s2", "acc-b", "two.example.com"), mapping("s3", "acc-b", "three.example.com"))
+	syncAll(t, h, "a", mapping("s1", "acc-a", "one.example.com"))
+	syncAll(t, h, "b", mapping("s2", "acc-b", "two.example.com"), mapping("s3", "acc-b", "three.example.com"))
 
 	b := next(t, startSession(t, h))
 	assert.True(t, b.complete)
@@ -89,7 +143,7 @@ func TestSnapshotMergesAllManagements(t *testing.T) {
 
 func TestSnapshotWaitsForAllManagements(t *testing.T) {
 	h := newTestHub(t, "a", "b")
-	syncAll(h, "a", mapping("s1", "acc-a", "one.example.com"))
+	syncAll(t, h, "a", mapping("s1", "acc-a", "one.example.com"))
 	ch := startSession(t, h)
 
 	select {
@@ -98,7 +152,7 @@ func TestSnapshotWaitsForAllManagements(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 
-	syncAll(h, "b", mapping("s2", "acc-b", "two.example.com"))
+	syncAll(t, h, "b", mapping("s2", "acc-b", "two.example.com"))
 	b := next(t, ch)
 	assert.True(t, b.complete)
 	assert.Len(t, b.mappings, 2)
@@ -107,7 +161,7 @@ func TestSnapshotWaitsForAllManagements(t *testing.T) {
 func TestSnapshotTimeoutSendsPartialState(t *testing.T) {
 	h := newTestHub(t, "a", "b")
 	h.syncTimeout = 50 * time.Millisecond
-	syncAll(h, "a", mapping("s1", "acc-a", "one.example.com"))
+	syncAll(t, h, "a", mapping("s1", "acc-a", "one.example.com"))
 
 	ch := startSession(t, h)
 	b := next(t, ch)
@@ -115,7 +169,7 @@ func TestSnapshotTimeoutSendsPartialState(t *testing.T) {
 	assert.Len(t, b.mappings, 1)
 
 	// A late management arrives as incremental update.
-	syncAll(h, "b", mapping("s2", "acc-b", "two.example.com"))
+	syncAll(t, h, "b", mapping("s2", "acc-b", "two.example.com"))
 	b = next(t, ch)
 	assert.False(t, b.complete)
 	assert.Equal(t, map[string]proto.ProxyMappingUpdateType{"s2": proto.ProxyMappingUpdateType_UPDATE_TYPE_CREATED}, ids(b.mappings))
@@ -123,7 +177,7 @@ func TestSnapshotTimeoutSendsPartialState(t *testing.T) {
 
 func TestEmptySnapshotIsComplete(t *testing.T) {
 	h := newTestHub(t, "a")
-	syncAll(h, "a")
+	syncAll(t, h, "a")
 	b := next(t, startSession(t, h))
 	assert.True(t, b.complete)
 	assert.Empty(t, b.mappings)
@@ -131,25 +185,29 @@ func TestEmptySnapshotIsComplete(t *testing.T) {
 
 func TestUpstreamResyncRemovesOnlyItsStaleServices(t *testing.T) {
 	h := newTestHub(t, "a", "b")
-	syncAll(h, "a", mapping("s1", "acc-a", "one.example.com"), mapping("s2", "acc-a", "two.example.com"))
-	syncAll(h, "b", mapping("s3", "acc-b", "three.example.com"))
+	syncAll(t, h, "a", mapping("s1", "acc-a", "one.example.com"), mapping("s2", "acc-a", "two.example.com"))
+	syncAll(t, h, "b", mapping("s3", "acc-b", "three.example.com"))
 	ch := startSession(t, h)
 	next(t, ch)
 
-	// a reconnects: s1 unchanged, s2 gone, s4 new; b must stay untouched.
+	// a reconnects: s1 still there, s2 gone, s4 new; b must stay untouched.
+	// s1 is forwarded as CREATED with its fresh one-time token, like
+	// management itself does on reconnect.
 	h.UpstreamDisconnected("a", nil)
-	h.UpstreamConnected("a")
+	_, gen, _ := h.ProxyInit()
+	h.UpstreamConnected("a", gen)
 	h.ApplyBatch("a", []*proto.ProxyMapping{mapping("s1", "acc-a", "one.example.com")}, false)
 	h.ApplyBatch("a", []*proto.ProxyMapping{mapping("s4", "acc-a", "four.example.com")}, true)
 
 	var got []*proto.ProxyMapping
-	for len(got) < 2 {
+	for len(got) < 3 {
 		got = append(got, next(t, ch).mappings...)
 	}
 	assert.Equal(t, map[string]proto.ProxyMappingUpdateType{
+		"s1": proto.ProxyMappingUpdateType_UPDATE_TYPE_CREATED,
 		"s4": proto.ProxyMappingUpdateType_UPDATE_TYPE_CREATED,
 		"s2": proto.ProxyMappingUpdateType_UPDATE_TYPE_REMOVED,
-	}, ids(got))
+	}, ids(got), "resync forwards current services and removes only a's stale ones")
 
 	// Removed domains still route to their last management (late calls).
 	name, ok := h.MgmtForDomain("two.example.com")
@@ -162,7 +220,7 @@ func TestUpstreamResyncRemovesOnlyItsStaleServices(t *testing.T) {
 
 func TestModifiedAndRemovedUpdates(t *testing.T) {
 	h := newTestHub(t, "a")
-	syncAll(h, "a", mapping("s1", "acc-a", "one.example.com"))
+	syncAll(t, h, "a", mapping("s1", "acc-a", "one.example.com"))
 	ch := startSession(t, h)
 	next(t, ch)
 
@@ -181,6 +239,14 @@ func TestModifiedAndRemovedUpdates(t *testing.T) {
 	assert.Equal(t, proto.ProxyMappingUpdateType_UPDATE_TYPE_REMOVED, b.mappings[0].GetType())
 	assert.Equal(t, "acc-a", b.mappings[0].GetAccountId(), "removal carries the stored mapping")
 
+	// MODIFIED for a service the proxy does not know yet must create it.
+	unknown := mapping("s9", "acc-a", "nine.example.com")
+	unknown.Type = proto.ProxyMappingUpdateType_UPDATE_TYPE_MODIFIED
+	h.ApplyBatch("a", []*proto.ProxyMapping{unknown}, false)
+	b = next(t, ch)
+	require.Len(t, b.mappings, 1)
+	assert.Equal(t, proto.ProxyMappingUpdateType_UPDATE_TYPE_CREATED, b.mappings[0].GetType(), "unknown MODIFIED becomes CREATED")
+
 	// Removing an unknown service is not forwarded.
 	h.ApplyBatch("a", []*proto.ProxyMapping{removed("nope")}, false)
 	select {
@@ -192,8 +258,8 @@ func TestModifiedAndRemovedUpdates(t *testing.T) {
 
 func TestConflictsAreRejected(t *testing.T) {
 	h := newTestHub(t, "a", "b")
-	syncAll(h, "a", mapping("s1", "acc-a", "one.example.com"))
-	syncAll(h, "b",
+	syncAll(t, h, "a", mapping("s1", "acc-a", "one.example.com"))
+	syncAll(t, h, "b",
 		mapping("s2", "acc-b", "ONE.example.com"),   // domain owned by a
 		mapping("s3", "acc-a", "three.example.com"), // account owned by a
 		mapping("s1", "acc-b", "four.example.com"),  // service ID owned by a
@@ -216,8 +282,8 @@ func TestConflictsAreRejected(t *testing.T) {
 
 func TestRouting(t *testing.T) {
 	h := newTestHub(t, "a", "b")
-	syncAll(h, "a", mapping("s1", "acc-a", "one.example.com"))
-	syncAll(h, "b", mapping("s2", "acc-b", "two.example.com"))
+	syncAll(t, h, "a", mapping("s1", "acc-a", "one.example.com"))
+	syncAll(t, h, "b", mapping("s2", "acc-b", "two.example.com"))
 
 	for _, tc := range []struct{ key, want string }{
 		{"acc-a", "a"}, {"acc-b", "b"},
@@ -246,7 +312,7 @@ func TestSingleManagementRoutesUnknownKeys(t *testing.T) {
 
 func TestNewSessionSupersedesOld(t *testing.T) {
 	h := newTestHub(t, "a")
-	syncAll(h, "a", mapping("s1", "acc-a", "one.example.com"))
+	syncAll(t, h, "a", mapping("s1", "acc-a", "one.example.com"))
 
 	done := make(chan error, 1)
 	go func() {
@@ -270,7 +336,7 @@ func TestLargeSnapshotIsChunked(t *testing.T) {
 	for i := range 250 {
 		ms = append(ms, mapping("s"+string(rune('A'+i/26))+string(rune('a'+i%26)), "acc-a", ""))
 	}
-	syncAll(h, "a", ms...)
+	syncAll(t, h, "a", ms...)
 
 	ch := startSession(t, h)
 	total := 0

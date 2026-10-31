@@ -21,23 +21,24 @@ const snapshotBatchSize = 100
 // derived from it, and the single downstream proxy session.
 type Hub struct {
 	log         *log.Entry
-	startedAt   time.Time
 	syncTimeout time.Duration
 
-	mu         sync.Mutex
-	order      []string
-	mgmts      map[string]*mgmtState
-	services   map[string]string // service ID -> management
-	accounts   map[string]*owner // account ID -> management
-	domains    map[string]*owner // normalized domain -> management
+	mu       sync.Mutex
+	order    []string
+	mgmts    map[string]*mgmtState
+	services map[string]string // service ID -> management
+	accounts map[string]*owner // account ID -> management
+	domains  map[string]*owner // normalized domain -> management
 	// lastOwner keeps the management of removed accounts and domains, so
 	// late calls (access logs, status updates) are still routed.
 	lastOwner map[string]string
-	init       *proto.SyncMappingsInit
-	initGen    uint64
-	initChange chan struct{} // closed and replaced whenever init changes
-	ready      chan struct{} // closed once every management synced once
-	readyDone  bool
+	init      *proto.SyncMappingsInit
+	// gen counts resync requests. Every proxy session bumps it and upstreams
+	// reconnect on change: management mints the one-time auth tokens per
+	// snapshot, so a session must never be served cached tokens.
+	gen        uint64
+	genChange  chan struct{} // closed and replaced whenever gen changes
+	syncDone   chan struct{} // closed and replaced whenever a management completes a sync
 	session    *session
 	sessionSeq uint64
 }
@@ -55,9 +56,11 @@ type mgmtState struct {
 	synced      bool
 	inSnapshot  bool
 	snapshotIDs map[string]struct{}
+	streamGen   uint64 // gen the current stream was opened for
+	syncedGen   uint64 // gen of the last completed snapshot
 	lastErr     string
 	lastSync    time.Time
-	rejected    int
+	rejected    map[string]struct{} // service IDs currently rejected for conflicts
 }
 
 type session struct {
@@ -72,15 +75,14 @@ type session struct {
 func NewHub(logger *log.Entry, mgmts []Management, syncTimeout time.Duration) *Hub {
 	h := &Hub{
 		log:         logger,
-		startedAt:   time.Now(),
 		syncTimeout: syncTimeout,
 		mgmts:       make(map[string]*mgmtState, len(mgmts)),
 		services:    make(map[string]string),
 		accounts:    make(map[string]*owner),
 		domains:     make(map[string]*owner),
 		lastOwner:   make(map[string]string),
-		initChange:  make(chan struct{}),
-		ready:       make(chan struct{}),
+		genChange:   make(chan struct{}),
+		syncDone:    make(chan struct{}),
 	}
 	for _, m := range mgmts {
 		h.order = append(h.order, m.Name)
@@ -88,43 +90,48 @@ func NewHub(logger *log.Entry, mgmts []Management, syncTimeout time.Duration) *H
 			name:     m.Name,
 			peerURL:  m.PeerURL,
 			services: make(map[string]*proto.ProxyMapping),
+			rejected: make(map[string]struct{}),
 		}
 	}
 	return h
 }
 
-// SetProxyInit records the proxy's identity and capabilities. Upstreams
-// reconnect with the new values when they change.
+// SetProxyInit records the proxy's identity and capabilities. Upstreams use
+// it when they reconnect for the session that follows.
 func (h *Hub) SetProxyInit(in *proto.SyncMappingsInit) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-
-	if h.init != nil && gproto.Equal(h.init, in) {
-		return
-	}
 	h.init = gproto.Clone(in).(*proto.SyncMappingsInit)
-	h.initGen++
-	close(h.initChange)
-	h.initChange = make(chan struct{})
 }
 
-// ProxyInit returns the current proxy init, its generation and a channel
-// closed when it changes. The init is nil until the proxy first connects.
+// ProxyInit returns the current proxy init, the resync generation and a
+// channel closed when the generation changes. The init is nil until the
+// proxy first connects.
 func (h *Hub) ProxyInit() (*proto.SyncMappingsInit, uint64, <-chan struct{}) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.init == nil {
-		return nil, 0, h.initChange
+		return nil, h.gen, h.genChange
 	}
-	return gproto.Clone(h.init).(*proto.SyncMappingsInit), h.initGen, h.initChange
+	return gproto.Clone(h.init).(*proto.SyncMappingsInit), h.gen, h.genChange
 }
 
-// UpstreamConnected starts a new snapshot phase for a management.
-func (h *Hub) UpstreamConnected(name string) {
+func (h *Hub) bumpGenLocked() uint64 {
+	h.gen++
+	close(h.genChange)
+	h.genChange = make(chan struct{})
+	return h.gen
+}
+
+// UpstreamConnected starts a new snapshot phase for a management whose
+// stream was opened for resync generation gen.
+func (h *Hub) UpstreamConnected(name string, gen uint64) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	st := h.mgmts[name]
+	st.streamGen = gen
 	st.connected = true
+	clear(st.rejected)
 	st.inSnapshot = true
 	st.snapshotIDs = make(map[string]struct{})
 	st.lastErr = ""
@@ -168,9 +175,11 @@ func (h *Hub) ApplyBatch(name string, mappings []*proto.ProxyMapping, initialSyn
 		st.inSnapshot = false
 		st.snapshotIDs = nil
 		st.synced = true
+		st.syncedGen = st.streamGen
 		st.lastSync = time.Now()
 		h.log.WithField("management", name).Infof("initial sync complete, %d services", len(st.services))
-		h.checkReadyLocked()
+		close(h.syncDone)
+		h.syncDone = make(chan struct{})
 	}
 
 	h.publishLocked(out)
@@ -185,6 +194,7 @@ func (h *Hub) applyLocked(st *mgmtState, m *proto.ProxyMapping) []*proto.ProxyMa
 	}
 
 	if m.GetType() == proto.ProxyMappingUpdateType_UPDATE_TYPE_REMOVED {
+		delete(st.rejected, id)
 		if _, ok := st.services[id]; !ok {
 			return nil
 		}
@@ -193,32 +203,34 @@ func (h *Hub) applyLocked(st *mgmtState, m *proto.ProxyMapping) []*proto.ProxyMa
 
 	if other, ok := h.services[id]; ok && other != st.name {
 		logger.Errorf("service ID already provided by management %q, rejecting", other)
-		st.rejected++
+		st.rejected[id] = struct{}{}
 		return nil
 	}
 	if o, ok := h.accounts[m.GetAccountId()]; ok && o.mgmt != st.name {
 		logger.Errorf("account %s already provided by management %q, rejecting", m.GetAccountId(), o.mgmt)
-		st.rejected++
+		st.rejected[id] = struct{}{}
 		return nil
 	}
 	if d := normalizeDomain(m.GetDomain()); d != "" {
 		if o, ok := h.domains[d]; ok && o.mgmt != st.name {
 			logger.Errorf("domain already served for management %q, rejecting", o.mgmt)
-			st.rejected++
+			st.rejected[id] = struct{}{}
 			return nil
 		}
 	}
 
+	delete(st.rejected, id)
 	stored := gproto.Clone(m).(*proto.ProxyMapping)
 	stored.Type = proto.ProxyMappingUpdateType_UPDATE_TYPE_CREATED
 
-	fwd := gproto.Clone(stored).(*proto.ProxyMapping)
+	// Forward the type management sent: a resync snapshot arrives as CREATED,
+	// which is what makes the proxy (re)create a peer that failed before.
+	// Every mapping carries a fresh one-time token, so none is skipped.
+	fwd := gproto.Clone(m).(*proto.ProxyMapping)
 	if old, ok := st.services[id]; ok {
-		if gproto.Equal(old, stored) {
-			return nil
-		}
 		h.unindexLocked(old)
-		fwd.Type = proto.ProxyMappingUpdateType_UPDATE_TYPE_MODIFIED
+	} else if fwd.GetType() == proto.ProxyMappingUpdateType_UPDATE_TYPE_MODIFIED {
+		fwd.Type = proto.ProxyMappingUpdateType_UPDATE_TYPE_CREATED
 	}
 	st.services[id] = stored
 	h.indexLocked(st.name, stored)
@@ -266,19 +278,6 @@ func (h *Hub) dropRefLocked(idx map[string]*owner, lastKey, key string) {
 	}
 }
 
-func (h *Hub) checkReadyLocked() {
-	if h.readyDone {
-		return
-	}
-	for _, st := range h.mgmts {
-		if !st.synced {
-			return
-		}
-	}
-	h.readyDone = true
-	close(h.ready)
-}
-
 func (h *Hub) publishLocked(out []*proto.ProxyMapping) {
 	s := h.session
 	if len(out) == 0 || s == nil || !s.live {
@@ -292,8 +291,9 @@ func (h *Hub) publishLocked(out []*proto.ProxyMapping) {
 }
 
 // RunSession streams the merged state to the proxy: a full snapshot once
-// every management synced (or the initial sync timeout passed), then
-// incremental changes. A newer session cancels this one.
+// every management completed a fresh sync for this session (or the initial
+// sync timeout passed), then incremental changes. A newer session cancels
+// this one.
 func (h *Hub) RunSession(ctx context.Context, send func(batch []*proto.ProxyMapping, complete bool) error) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -305,6 +305,7 @@ func (h *Hub) RunSession(ctx context.Context, send func(batch []*proto.ProxyMapp
 	h.sessionSeq++
 	s := &session{id: h.sessionSeq, cancel: cancel, notify: make(chan struct{}, 1)}
 	h.session = s
+	gen := h.bumpGenLocked()
 	h.mu.Unlock()
 
 	defer func() {
@@ -315,7 +316,7 @@ func (h *Hub) RunSession(ctx context.Context, send func(batch []*proto.ProxyMapp
 		h.mu.Unlock()
 	}()
 
-	if err := h.waitReady(ctx); err != nil {
+	if err := h.waitSynced(ctx, gen); err != nil {
 		return err
 	}
 
@@ -345,29 +346,40 @@ func (h *Hub) RunSession(ctx context.Context, send func(batch []*proto.ProxyMapp
 	}
 }
 
-func (h *Hub) waitReady(ctx context.Context) error {
-	wait := time.Until(h.startedAt.Add(h.syncTimeout))
-	if wait < 0 {
-		wait = 0
-	}
-	timer := time.NewTimer(wait)
+// waitSynced blocks until every management completed a sync opened for gen,
+// so the snapshot carries one-time tokens management has not handed out yet.
+func (h *Hub) waitSynced(ctx context.Context, gen uint64) error {
+	timer := time.NewTimer(h.syncTimeout)
 	defer timer.Stop()
-	select {
-	case <-h.ready:
-	case <-timer.C:
+	for {
 		h.mu.Lock()
-		if !h.readyDone {
-			for _, name := range h.order {
-				if !h.mgmts[name].synced {
-					h.log.WithField("management", name).Warn("not synced yet, proxy snapshot will not include it")
-				}
-			}
-		}
+		pending := h.unsyncedLocked(gen)
+		done := h.syncDone
 		h.mu.Unlock()
-	case <-ctx.Done():
-		return ctx.Err()
+		if len(pending) == 0 {
+			return nil
+		}
+		select {
+		case <-done:
+		case <-timer.C:
+			for _, name := range pending {
+				h.log.WithField("management", name).Warn("no fresh sync yet, proxy snapshot uses its cached mappings")
+			}
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
-	return nil
+}
+
+func (h *Hub) unsyncedLocked(gen uint64) []string {
+	var pending []string
+	for _, name := range h.order {
+		if h.mgmts[name].syncedGen < gen {
+			pending = append(pending, name)
+		}
+	}
+	return pending
 }
 
 func (h *Hub) snapshotLocked() []*proto.ProxyMapping {
@@ -455,7 +467,7 @@ func (h *Hub) Status() []MgmtStatus {
 			Connected: st.connected,
 			Synced:    st.synced,
 			Services:  len(st.services),
-			Rejected:  st.rejected,
+			Rejected:  len(st.rejected),
 			LastSync:  st.lastSync,
 			LastError: st.lastErr,
 		})
