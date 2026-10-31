@@ -20,8 +20,9 @@ const snapshotBatchSize = 100
 // Hub holds the merged mapping state of all managements, the routing indexes
 // derived from it, and the single downstream proxy session.
 type Hub struct {
-	log         *log.Entry
-	syncTimeout time.Duration
+	log                 *log.Entry
+	syncTimeout         time.Duration
+	allowDirectUpstream bool
 
 	mu       sync.Mutex
 	order    []string
@@ -201,6 +202,17 @@ func (h *Hub) applyLocked(st *mgmtState, m *proto.ProxyMapping) []*proto.ProxyMa
 		return []*proto.ProxyMapping{h.removeLocked(st, id)}
 	}
 
+	if h.dialsHostNetwork(m) {
+		logger.Error("direct upstream target needs allow_direct_upstream, rejecting")
+		st.rejected[id] = struct{}{}
+		// Withdraw an accepted version too: keeping it would serve a policy
+		// the management meant to replace.
+		if _, ok := st.services[id]; ok {
+			return []*proto.ProxyMapping{h.removeLocked(st, id)}
+		}
+		return nil
+	}
+
 	if other, ok := h.services[id]; ok && other != st.name {
 		logger.Errorf("service ID already provided by management %q, rejecting", other)
 		st.rejected[id] = struct{}{}
@@ -235,6 +247,21 @@ func (h *Hub) applyLocked(st *mgmtState, m *proto.ProxyMapping) []*proto.ProxyMa
 	st.services[id] = stored
 	h.indexLocked(st.name, stored)
 	return []*proto.ProxyMapping{fwd}
+}
+
+// dialsHostNetwork reports whether a mapping has a target the proxy would
+// dial from its own host network (direct upstream or proxy cluster target)
+// while that is not allowed.
+func (h *Hub) dialsHostNetwork(m *proto.ProxyMapping) bool {
+	if h.allowDirectUpstream {
+		return false
+	}
+	for _, p := range m.GetPath() {
+		if p.GetOptions().GetDirectUpstream() {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Hub) removeLocked(st *mgmtState, id string) *proto.ProxyMapping {
