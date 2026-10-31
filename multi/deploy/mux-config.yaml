@@ -18,7 +18,9 @@ initial_sync_timeout: 30s
 # Direct upstream and proxy cluster targets make the proxy dial from its own
 # host network (only offered when the proxy runs with NB_PROXY_PRIVATE=true).
 # On a shared proxy every management admin could reach your host network that
-# way, so such mappings are rejected unless this is true.
+# way, so such mappings are rejected unless this is true. Only enable it
+# together with NB_PROXY_DIRECT_UPSTREAM_BLOCK_PRIVATE=true on the proxy,
+# which limits these dials to public addresses.
 allow_direct_upstream: false
 
 # ${VAR} is replaced with the environment variable VAR.
