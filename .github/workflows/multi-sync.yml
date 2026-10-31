@@ -1,0 +1,126 @@
+# Merges upstream main every morning. When upstream publishes a new release,
+# tags "<release>-multi" (the release plus this fork's own commits), which
+# triggers multi-build.yml.
+#
+# Needs the secret SYNC_TOKEN: a fine-grained token for this repository with
+# "Contents: read and write" and "Workflows: read and write". GITHUB_TOKEN
+# cannot push upstream changes to .github/workflows, and its pushes would not
+# trigger the image build.
+name: multi - sync upstream
+
+on:
+  schedule:
+    - cron: "0 4 * * *" # 05:00 CET / 06:00 CEST
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: multi-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/netbirdio/netbird.git
+  UPSTREAM_REPO: netbirdio/netbird
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check token
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          if [ -z "$SYNC_TOKEN" ]; then
+            echo "::error::secret SYNC_TOKEN is missing (see header of multi-sync.yml)"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          # Keep this fork's README on conflicts (see .gitattributes).
+          git config merge.ours.driver true
+          git remote add upstream "$UPSTREAM"
+          git fetch --no-tags upstream main
+
+      - name: Merge upstream main
+        id: merge
+        run: |
+          before=$(git rev-parse HEAD)
+          if ! git merge --no-edit -m "Merge upstream $(git rev-parse --short upstream/main)" upstream/main; then
+            echo "::error::merge conflict with upstream, resolve manually:"
+            git diff --name-only --diff-filter=U | sed 's/^/::error::  /'
+            exit 1
+          fi
+          if [ "$before" = "$(git rev-parse HEAD)" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "already up to date"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git log --oneline "$before..HEAD" | head -50
+          fi
+
+      - uses: actions/setup-go@v5
+        if: steps.merge.outputs.changed == 'true'
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            multi/mux/go.sum
+
+      - name: Test
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          go build ./proxy/cmd/proxy
+          go test ./proxy/internal/roundtrip/
+          (cd multi/mux && go test -race ./...)
+
+      - name: Push
+        if: steps.merge.outputs.changed == 'true'
+        run: git push origin main
+
+      - name: Tag new upstream release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh release view --repo "$UPSTREAM_REPO" --json tagName -q .tagName)
+          ours="${tag}-multi"
+          if git ls-remote --exit-code --tags origin "refs/tags/$ours" >/dev/null; then
+            echo "$ours already exists"
+            exit 0
+          fi
+
+          # Release commit plus this fork's own (non-merge) commits.
+          git fetch --no-tags upstream "refs/tags/${tag}:refs/upstream-tags/${tag}"
+          commits=$(git rev-list --reverse --no-merges main ^upstream/main)
+          git checkout --detach "refs/upstream-tags/$tag"
+          for c in $commits; do
+            if ! git cherry-pick -x "$c"; then
+              echo "::error::cherry-pick of $c onto $tag failed, tag $ours manually"
+              exit 1
+            fi
+          done
+          git tag -a "$ours" -m "$tag with multi-management patches"
+          git push origin "$ours"
+          echo "::notice::tagged $ours, image build starts via multi-build.yml"
+
+      # Upstream workflows are not meant to run in this fork.
+      - name: Disable upstream workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow list --all --json id,path,state \
+            -q '.[] | select(.state == "active") | select(.path | test("^\\.github/workflows/multi-") | not) | .id' |
+          while read -r id; do
+            gh workflow disable "$id"
+          done
