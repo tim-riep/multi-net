@@ -85,6 +85,18 @@ jobs:
           go test ./proxy/internal/roundtrip/
           (cd multi/mux && go test -race ./...)
 
+      # Upstream workflows are not meant to run in this fork. Disable them before
+      # pushing, since a push to main would trigger them.
+      - name: Disable upstream workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow list --all --json id,path,state \
+            -q '.[] | select(.state == "active") | select(.path | test("^\\.github/workflows/multi-") | not) | .id' |
+          while read -r id; do
+            gh workflow disable "$id"
+          done
+
       - name: Push
         if: steps.merge.outputs.changed == 'true'
         run: git push origin main
@@ -114,8 +126,8 @@ jobs:
           git push origin "$ours"
           echo "::notice::tagged $ours, image build starts via multi-build.yml"
 
-      # Upstream workflows are not meant to run in this fork.
-      - name: Disable upstream workflows
+      # Catches workflows newly added upstream by this merge.
+      - name: Disable new upstream workflows
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
