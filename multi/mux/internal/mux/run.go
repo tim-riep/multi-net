@@ -21,6 +21,7 @@ import (
 // Run starts the multiplexer and blocks until ctx is canceled.
 func Run(ctx context.Context, cfg *Config, logger *log.Entry) error {
 	hub := NewHub(logger, cfg.Managements, cfg.InitialSyncTimeout)
+	hub.allowDirectUpstream = cfg.AllowDirectUpstream
 
 	upstreams := make(map[string]*Upstream, len(cfg.Managements))
 	for _, m := range cfg.Managements {

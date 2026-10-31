@@ -27,7 +27,11 @@ type Config struct {
 	// InitialSyncTimeout bounds how long the first snapshot to the proxy
 	// waits for all managements to finish their initial sync.
 	InitialSyncTimeout time.Duration `yaml:"initial_sync_timeout"`
-	Managements        []Management  `yaml:"managements"`
+	// AllowDirectUpstream lets managements use direct upstream targets
+	// (including proxy cluster targets), which the proxy dials from its own
+	// host network instead of through the tunnel. Off for a shared proxy.
+	AllowDirectUpstream bool         `yaml:"allow_direct_upstream"`
+	Managements         []Management `yaml:"managements"`
 }
 
 // Management is one upstream management server.
