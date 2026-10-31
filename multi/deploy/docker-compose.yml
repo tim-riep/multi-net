@@ -1,10 +1,8 @@
 # Shared reverse proxy for several managements.
-# Build the images first (from the repository root):
-#   docker build -f proxy/Dockerfile.multistage -t multi-proxy:latest .
-#   docker build -t mgmt-mux:latest multi/mux
+# Images are published by .github/workflows/multi-build.yml.
 services:
   mgmt-mux:
-    image: mgmt-mux:latest
+    image: ghcr.io/tim-riep/mgmt-mux:latest
     restart: unless-stopped
     env_file: mux.env  # NB_PROXY_TOKEN, TOKEN_KUNDE_A, TOKEN_KUNDE_B
     volumes:
@@ -12,7 +10,7 @@ services:
     networks: [internal]
 
   proxy:
-    image: multi-proxy:latest
+    image: ghcr.io/tim-riep/multi-proxy:latest
     restart: unless-stopped
     depends_on: [mgmt-mux]
     env_file: mux.env  # NB_PROXY_TOKEN must match the mux proxy_token

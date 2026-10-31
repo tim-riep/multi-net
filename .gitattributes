@@ -1,1 +1,4 @@
 *.go text eol=lf
+
+# multi-net fork: keep our README when upstream changes it (merge.ours.driver=true)
+/README.md merge=ours
