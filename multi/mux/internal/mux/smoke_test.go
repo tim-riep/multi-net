@@ -25,7 +25,8 @@ func (s *syncBuf) Write(p []byte) (int, error) { s.mu.Lock(); defer s.mu.Unlock(
 func (s *syncBuf) String() string              { s.mu.Lock(); defer s.mu.Unlock(); return s.b.String() }
 
 // TestSmokeRealProxy runs a real (patched) proxy binary against the
-// multiplexer and two fake managements:
+// multiplexer and two fake managements that hand out one-time tokens, then
+// restarts only the proxy, which must create its peers again:
 //
 //	SMOKE_PROXY_BIN=/path/to/netbird-proxy SMOKE_CERT_DIR=/dir/with/tls.crt+tls.key go test -run Smoke ./internal/mux/
 func TestSmokeRealProxy(t *testing.T) {
@@ -33,8 +34,8 @@ func TestSmokeRealProxy(t *testing.T) {
 	if bin == "" {
 		t.Skip("SMOKE_PROXY_BIN not set")
 	}
-	a := &fakeMgmt{snapshot: []*proto.ProxyMapping{withPath(mapping("svc-a1", "acc-a", "app.kunde-a.de"))}, push: make(chan *proto.ProxyMapping)}
-	b := &fakeMgmt{snapshot: []*proto.ProxyMapping{withPath(mapping("svc-b1", "acc-b", "app.kunde-b.de"))}, push: make(chan *proto.ProxyMapping)}
+	a := &fakeMgmt{snapshot: []*proto.ProxyMapping{withPath(mapping("svc-a1", "acc-a", "app.kunde-a.de"))}, oneTime: true, push: make(chan *proto.ProxyMapping)}
+	b := &fakeMgmt{snapshot: []*proto.ProxyMapping{withPath(mapping("svc-b1", "acc-b", "app.kunde-b.de"))}, oneTime: true, push: make(chan *proto.ProxyMapping)}
 	cfg := &Config{
 		Listen: freeAddr(t), ProxyToken: "proxy-secret", InitialSyncTimeout: 5 * time.Second,
 		Managements: []Management{
@@ -46,8 +47,34 @@ func TestSmokeRealProxy(t *testing.T) {
 	defer cancel()
 	go func() { _ = Run(ctx, cfg, log.NewEntry(log.StandardLogger())) }()
 
+	var all strings.Builder
+	for run := 1; run <= 2; run++ {
+		logs := runSmokeProxy(ctx, t, bin, cfg.Listen)
+		all.WriteString(logs)
+
+		assert.Contains(t, logs, "Initial mapping sync complete", "run %d", run)
+		assert.Contains(t, logs, "management_url: https://mgmt-a.invalid:443", "run %d", run)
+		assert.Contains(t, logs, "management_url: https://mgmt-b.invalid:443", "run %d", run)
+		assert.NotContains(t, logs, "invalid token", "run %d: proxy got a spent one-time token", run)
+	}
+	if p := os.Getenv("SMOKE_LOG"); p != "" {
+		_ = os.WriteFile(p, []byte(all.String()), 0o644)
+	}
+
+	for name, f := range map[string]*fakeMgmt{"a": a, "b": b} {
+		f.mu.Lock()
+		assert.Len(t, f.peerReqs, 2, "%s: one peer per proxy start", name)
+		assert.Contains(t, f.tokens, "Bearer token-"+name)
+		f.mu.Unlock()
+	}
+}
+
+// runSmokeProxy starts the proxy, waits until both accounts got their
+// embedded client, then kills it and returns its logs.
+func runSmokeProxy(ctx context.Context, t *testing.T, bin, muxAddr string) string {
+	t.Helper()
 	out := &syncBuf{}
-	cmd := exec.CommandContext(ctx, bin, "--mgmt=http://"+cfg.Listen, "--addr="+freeAddr(t), "--health-addr="+freeAddr(t),
+	cmd := exec.CommandContext(ctx, bin, "--mgmt=http://"+muxAddr, "--addr="+freeAddr(t), "--health-addr="+freeAddr(t),
 		"--cert-dir="+os.Getenv("SMOKE_CERT_DIR"), "--domain=proxy.example.com", "--log-level=debug")
 	cmd.Env = append(os.Environ(), "NB_PROXY_TOKEN=proxy-secret", "NB_PROXY_ALLOW_INSECURE=true", "HOME="+t.TempDir())
 	cmd.Stdout, cmd.Stderr = out, out
@@ -57,30 +84,18 @@ func TestSmokeRealProxy(t *testing.T) {
 	deadline := time.Now().Add(40 * time.Second)
 	for time.Now().Before(deadline) {
 		s := out.String()
-		if strings.Contains(s, "mgmt-a.invalid") && strings.Contains(s, "mgmt-b.invalid") && strings.Contains(s, "Initial mapping sync complete") {
+		done := strings.Contains(s, "mgmt-a.invalid") && strings.Contains(s, "mgmt-b.invalid")
+		if done || strings.Contains(s, "invalid token") {
 			break
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
 	_ = cmd.Process.Kill()
-	logs := out.String()
-	if p := os.Getenv("SMOKE_LOG"); p != "" {
-		_ = os.WriteFile(p, []byte(logs), 0o644)
-	}
-
-	assert.Contains(t, logs, "Initial mapping sync complete")
-	assert.Contains(t, logs, "management_url: https://mgmt-a.invalid:443")
-	assert.Contains(t, logs, "management_url: https://mgmt-b.invalid:443")
-	for name, f := range map[string]*fakeMgmt{"a": a, "b": b} {
-		f.mu.Lock()
-		assert.Len(t, f.peerReqs, 1, name)
-		assert.Contains(t, f.tokens, "Bearer token-"+name)
-		f.mu.Unlock()
-	}
+	_ = cmd.Wait()
+	return out.String()
 }
 
 func withPath(m *proto.ProxyMapping) *proto.ProxyMapping {
-	m.AuthToken = "setup-" + m.GetId()
 	m.Path = []*proto.PathMapping{{Path: "/", Target: "http://100.64.0.10:8080"}}
 	return m
 }
