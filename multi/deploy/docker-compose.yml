@@ -1,0 +1,38 @@
+# Shared reverse proxy for several managements.
+# Build the images first (from the repository root):
+#   docker build -f proxy/Dockerfile.multistage -t multi-proxy:latest .
+#   docker build -t mgmt-mux:latest multi/mux
+services:
+  mgmt-mux:
+    image: mgmt-mux:latest
+    restart: unless-stopped
+    env_file: mux.env  # NB_PROXY_TOKEN, TOKEN_KUNDE_A, TOKEN_KUNDE_B
+    volumes:
+      - ./mux-config.yaml:/etc/mgmt-mux/config.yaml:ro
+    networks: [internal]
+
+  proxy:
+    image: multi-proxy:latest
+    restart: unless-stopped
+    depends_on: [mgmt-mux]
+    env_file: mux.env  # NB_PROXY_TOKEN must match the mux proxy_token
+    environment:
+      NB_PROXY_MANAGEMENT_ADDRESS: http://mgmt-mux:50051
+      # Plain gRPC inside the compose network; use TLS on the mux otherwise.
+      NB_PROXY_ALLOW_INSECURE: "true"
+      NB_PROXY_DOMAIN: proxy.example.com
+      NB_PROXY_ADDRESS: ":8443"
+      NB_PROXY_ACME_CERTIFICATES: "true"
+      NB_PROXY_ACME_ADDRESS: ":8080"
+    ports:
+      - "443:8443"
+      - "80:8080"
+    volumes:
+      - proxy-certs:/certs
+    networks: [internal]
+
+networks:
+  internal: {}
+
+volumes:
+  proxy-certs: {}
