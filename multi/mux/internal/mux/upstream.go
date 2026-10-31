@@ -127,8 +127,8 @@ func (u *Upstream) Run(ctx context.Context) {
 	_ = backoff.RetryNotify(op, backoff.WithContext(bo, ctx), notify)
 }
 
-// streamContext is canceled when the proxy init changes, so the management
-// learns about a restarted proxy.
+// streamContext is canceled when the resync generation changes, so every
+// proxy session gets a fresh snapshot with unused one-time tokens.
 func (u *Upstream) streamContext(ctx context.Context, gen uint64) (context.Context, context.CancelFunc) {
 	sctx, cancel := context.WithCancel(ctx)
 	go func() {
@@ -172,7 +172,7 @@ func (u *Upstream) syncMappings(ctx context.Context, init *proto.SyncMappingsIni
 		if err != nil {
 			return err
 		}
-		u.markConnected(connected)
+		u.markConnected(connected, gen)
 		u.hub.ApplyBatch(u.cfg.Name, msg.GetMapping(), msg.GetInitialSyncComplete())
 		if err := stream.Send(&proto.SyncMappingsRequest{Msg: &proto.SyncMappingsRequest_Ack{Ack: &proto.SyncMappingsAck{}}}); err != nil {
 			return fmt.Errorf("send ack: %w", err)
@@ -202,19 +202,19 @@ func (u *Upstream) getMappingUpdate(ctx context.Context, init *proto.SyncMapping
 		if err != nil {
 			return err
 		}
-		u.markConnected(connected)
+		u.markConnected(connected, gen)
 		u.hub.ApplyBatch(u.cfg.Name, msg.GetMapping(), msg.GetInitialSyncComplete())
 	}
 }
 
 // markConnected starts the snapshot phase on the first message of a stream;
 // gRPC streams open lazily, so this is the first proof the management is up.
-func (u *Upstream) markConnected(connected *bool) {
+func (u *Upstream) markConnected(connected *bool, gen uint64) {
 	if *connected {
 		return
 	}
 	*connected = true
-	u.hub.UpstreamConnected(u.cfg.Name)
+	u.hub.UpstreamConnected(u.cfg.Name, gen)
 	u.log.Info("mapping stream established")
 }
 
