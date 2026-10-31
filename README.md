@@ -83,7 +83,9 @@ docker build -t mgmt-mux multi/mux
 2. Baut den Proxy und testet ihn sowie mgmt-mux, dann wird gepusht.
 3. Gibt es ein neues Upstream-Release, legt der Workflow den Tag `<release>-multi` an. Der Tag
    enthält genau das Release plus die eigenen Commits dieses Forks und startet damit den Build.
-4. Deaktiviert die Upstream-Workflows, die in diesem Fork nicht laufen sollen.
+4. Deaktiviert vor dem Push alle Upstream-Workflows, denn jeder Push auf `main` würde sie sonst
+   starten. Ein Workflow, den Upstream neu hinzufügt, kann ein einziges Mal anlaufen, bevor er
+   nach dem Push deaktiviert wird.
 
 **`multi-build.yml`** baut beide Images für jeden `v*-multi`-Tag. Von Hand lässt er sich mit
 beliebigem Ref starten.
