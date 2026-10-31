@@ -19,6 +19,7 @@ import (
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	grpcstatus "google.golang.org/grpc/status"
 
 	"github.com/netbirdio/netbird/client/embed"
@@ -39,6 +40,13 @@ const envProxyClientLogLevel = "NB_PROXY_CLIENT_LOG_LEVEL"
 const clientStopTimeout = 30 * time.Second
 
 const createProxyPeerTimeout = 30 * time.Second
+
+// ManagementURLHeader is the CreateProxyPeer response header a multiplexing
+// management frontend uses to tell the proxy which management server the
+// account's embedded client must connect to. Absent means MgmtAddr.
+//
+// Modified 2026-10-31: added for multi-management operation (netbird-multi fork).
+const ManagementURLHeader = "x-nb-management-url"
 
 // backendKey identifies a backend by its host:port from the target URL.
 type backendKey string
@@ -333,13 +341,14 @@ func (n *NetBird) createClientEntry(ctx context.Context, accountID types.Account
 
 	createCtx, cancel := context.WithTimeout(ctx, createProxyPeerTimeout)
 	defer cancel()
+	var respHeader metadata.MD
 	resp, err := n.mgmtClient.CreateProxyPeer(createCtx, &proto.CreateProxyPeerRequest{
 		ServiceId:          string(serviceID),
 		AccountId:          string(accountID),
 		Token:              authToken,
 		WireguardPublicKey: publicKey.String(),
 		Cluster:            n.proxyAddr,
-	})
+	}, grpc.Header(&respHeader))
 	if err != nil {
 		return nil, fmt.Errorf("authenticate proxy peer with management: %w", err)
 	}
@@ -389,7 +398,7 @@ func (n *NetBird) createClientEntry(ctx context.Context, accountID types.Account
 	wgPort := int(n.clientCfg.WGPort)
 	embedOpts := embed.Options{
 		DeviceName:          deviceNamePrefix + n.proxyID,
-		ManagementURL:       n.clientCfg.MgmtAddr,
+		ManagementURL:       managementURLFromHeader(respHeader, n.clientCfg.MgmtAddr),
 		PrivateKey:          privateKey.String(),
 		LogLevel:            clientLogLevel,
 		BlockInbound:        n.clientCfg.BlockInbound,
@@ -936,4 +945,13 @@ func logEmbedOptions(logger *log.Logger, accountID types.AccountID, serviceID ty
 		"perf_buffers_per_pool": perfBuffers,
 		"perf_max_batch_size":   perfBatch,
 	}).Info("starting embedded netbird client for account")
+}
+
+// managementURLFromHeader returns the management URL announced in the
+// CreateProxyPeer response header, falling back to the configured address.
+func managementURLFromHeader(md metadata.MD, fallback string) string {
+	if v := md.Get(ManagementURLHeader); len(v) > 0 && strings.TrimSpace(v[0]) != "" {
+		return strings.TrimSpace(v[0])
+	}
+	return fallback
 }

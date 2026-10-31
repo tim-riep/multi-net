@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 
 	"github.com/netbirdio/netbird/client/embed"
 	"github.com/netbirdio/netbird/proxy/internal/types"
@@ -549,4 +550,22 @@ func TestNotifyClientReady_UsesBackgroundCtx(t *testing.T) {
 	require.NotNil(t, calls[0].ctx, "NotifyStatus must receive a context")
 	require.NoError(t, calls[0].ctx.Err(),
 		"NotifyStatus must receive a background context, not an inherited cancelled one")
+}
+
+func TestManagementURLFromHeader(t *testing.T) {
+	const fallback = "https://mgmt.example.com:443"
+	tests := []struct {
+		name string
+		md   metadata.MD
+		want string
+	}{
+		{name: "no header", md: nil, want: fallback},
+		{name: "empty value", md: metadata.Pairs(ManagementURLHeader, " "), want: fallback},
+		{name: "announced", md: metadata.Pairs(ManagementURLHeader, "https://other.example.com:443"), want: "https://other.example.com:443"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, managementURLFromHeader(tt.md, fallback))
+		})
+	}
 }
