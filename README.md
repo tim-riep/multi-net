@@ -1,195 +1,154 @@
-> **multi-net fork:** This fork lets one reverse proxy serve several management servers.
-> See [`multi/README.md`](multi/README.md). The proxy change (AGPL-3.0) is limited to
-> `proxy/internal/roundtrip/netbird.go`; everything else is upstream NetBird.
+# multi-net
 
+Ein gemeinsamer Reverse Proxy für **mehrere Management-Server**, so wie Relay und STUN schon heute
+von mehreren Managements gemeinsam genutzt werden.
 
-<div align="center">
-  <p align="center">
-    <img width="234" src="docs/media/logo-full.png" alt="NetBird logo"/>
-  </p>
-  <p align="center">
-    <a href="https://sonarcloud.io/dashboard?id=netbirdio_netbird">
-      <img src="https://sonarcloud.io/api/project_badges/measure?project=netbirdio_netbird&metric=alert_status" alt="SonarCloud alert status"/>
-    </a>
-    <a href="https://github.com/netbirdio/netbird/blob/main/LICENSE">
-      <img src="https://img.shields.io/badge/license-BSD--3-blue" alt="BSD-3 License"/>
-    </a>
-    <a href="https://docs.netbird.io/slack-url">
-      <img src="https://img.shields.io/badge/slack-@netbird-red.svg?logo=slack" alt="NetBird Slack"/>
-    </a>
-    <a href="https://forum.netbird.io">
-      <img src="https://img.shields.io/badge/community%20forum-@netbird-red.svg?logo=discourse" alt="Community forum"/>
-    </a>
-    <a href="https://gurubase.io/g/netbird">
-      <img src="https://img.shields.io/badge/Gurubase-Ask%20NetBird%20Guru-006BFF" alt="Gurubase: Ask NetBird Guru"/>
-    </a>
-  </p>
-</div>
+> Fork von [netbirdio/netbird](https://github.com/netbirdio/netbird). Abgesehen von den unten
+> genannten Dateien entspricht der Code dem Upstream-Projekt.
 
-<p align="center">
-  <strong>
-    Start using NetBird at <a href="https://netbird.io/pricing">netbird.io</a>
-    <br/>
-    See <a href="https://docs.netbird.io/">Documentation</a>
-    <br/>
-    Join our <a href="https://docs.netbird.io/slack-url">Slack channel</a> or our <a href="https://forum.netbird.io">Community forum</a>
-  </strong>
-  <br/>
-  <br/>
-  <strong>
-    🚀 <a href="https://netbird.io/careers">We are hiring! Join us at https://netbird.io/careers</a>
-  </strong>
-</p>
+## Bestandteile
 
-> ### 🤖 NetBird Agent Network (Beta)
-> Identity-aware access control for AI agents — keyless access to LLM APIs and private
-> resources over the encrypted NetBird tunnel. See [`agent-network/`](agent-network/) or
-> read the docs at **[netbird.ai](https://netbird.ai)**.
+| Pfad | Was | Lizenz |
+|------|-----|--------|
+| `multi/mux/` | **mgmt-mux**: gibt sich gegenüber dem Proxy als *ein* Management aus und leitet an beliebig viele Managements weiter | eigener Code, siehe [Lizenz](#lizenz) |
+| `proxy/internal/roundtrip/netbird.go` | ~25 Zeilen Änderung am Proxy | AGPL-3.0 |
+| `multi/docker/` | Dockerfile für das Proxy-Image | – |
+| `multi/deploy/` | docker-compose-Beispiel | – |
+| `.github/workflows/multi-*.yml` | täglicher Upstream-Sync und Image-Build | – |
 
-**NetBird combines a configuration-free peer-to-peer private network and a centralized access control system in a single platform, making it easy to create secure private networks for your organization or home.**
+## Funktionsweise
 
-**Connect.** NetBird creates a WireGuard-based overlay network that automatically connects your machines over an encrypted tunnel, leaving behind the hassle of opening ports, complex firewall rules, VPN gateways, and so forth.
+```
+                        ┌──────────────┐  Token A   ┌──────────────┐
+Internet ──► Proxy ───► │  mgmt-mux    │ ─────────► │ Management A │
+   :443                 │              │  Token B   ├──────────────┤
+                        │ merged state │ ─────────► │ Management B │
+                        └──────────────┘            └──────────────┘
+   eingebetteter Client je Account ──────────────►  Management des Accounts
+```
 
-**Secure.** NetBird enables secure remote access by applying granular access policies while allowing you to manage them intuitively from a single place. Works universally on any infrastructure.
+- **Mappings:** mgmt-mux hält zu jedem Management einen eigenen `SyncMappings`-Stream (Fallback
+  `GetMappingUpdate`) mit dessen Proxy-Token und führt alle Services zu einem Gesamtzustand
+  zusammen. Der Proxy bekommt einen gemeinsamen Snapshot und danach nur noch Änderungen.
+- **Resync eines Managements:** Nach einem Reconnect berechnet mgmt-mux selbst, was sich geändert
+  hat. Entfernt werden nur Services *dieses* Managements, unveränderte Services werden nicht neu
+  gesendet.
+- **Ausfall eines Managements:** Dessen Services bleiben aktiv, bis es wieder synchronisiert ist.
+- **Routing:** Jeder Aufruf wird über `account_id` bzw. die Domain dem richtigen Management
+  zugeordnet. Das gilt für `Authenticate`, `SendAccessLog`, `SendStatusUpdate`, `CreateProxyPeer`,
+  `GetOIDCURL`, `ValidateSession`, `ValidateTunnelPeer` und die LLM-Aufrufe.
+- **Eingebettete Clients:** Bei `CreateProxyPeer` schickt mgmt-mux den Header
+  `x-nb-management-url` mit. Der Proxy verbindet den Client des Accounts dann mit diesem
+  Management. Ohne den Header verhält sich der Proxy wie im Original.
+- **Konflikte:** Belegt ein Management eine Domain, Service-ID oder Account-ID, die schon ein
+  anderes Management belegt, wird das Mapping abgelehnt. Das steht dann im Log und im `/status`.
 
-https://github.com/user-attachments/assets/10cec749-bb56-4ab3-97af-4e38850108d2
+## Voraussetzungen auf den Managements
 
-### Self-host NetBird (video)
+Die Einrichtung ist bei jedem Management dieselbe wie für einen einzelnen Proxy:
 
-[![Watch the video](https://img.youtube.com/vi/bZAgpT6nzaQ/0.jpg)](https://youtu.be/bZAgpT6nzaQ)
+1. Ein Proxy-Token erzeugen (`token create --name shared-proxy` im Admin-Kommando der Installation).
+2. Die Proxy-Domain (`NB_PROXY_DOMAIN`, z. B. `proxy.example.com`) ist überall dieselbe, und die
+   Service-Domains zeigen per CNAME darauf.
+3. Jede Domain darf nur in einem Management vergeben sein.
 
-### Key features
+## Images
 
-| Connectivity | Management | Security | Automation | Platforms |
-|---|---|---|---|---|
-| ✓ [Kernel WireGuard](https://docs.netbird.io/about-netbird/why-wireguard-with-netbird) | ✓ [Admin Web UI](https://github.com/netbirdio/dashboard) | ✓ [SSO & MFA support](https://docs.netbird.io/how-to/installation#running-net-bird-with-sso-login) | ✓ [Public API](https://docs.netbird.io/api) | ✓ [Linux](https://docs.netbird.io/get-started/install/linux) |
-| ✓ [Peer-to-peer connections](https://docs.netbird.io/about-netbird/how-netbird-works) | ✓ Auto peer discovery and configuration | ✓ [Access control: groups & rules](https://docs.netbird.io/how-to/manage-network-access) | ✓ [Setup keys for bulk provisioning](https://docs.netbird.io/how-to/register-machines-using-setup-keys) | ✓ [macOS](https://docs.netbird.io/get-started/install/macos) |
-| ✓ Connection relay fallback | ✓ [IdP integrations](https://docs.netbird.io/selfhosted/identity-providers) | ✓ [Activity logging](https://docs.netbird.io/how-to/audit-events-logging) | ✓ [Self-hosting quickstart script](https://docs.netbird.io/selfhosted/selfhosted-quickstart) | ✓ [Windows](https://docs.netbird.io/get-started/install/windows) |
-| ✓ [Routes to external networks](https://docs.netbird.io/how-to/routing-traffic-to-private-networks) | ✓ [Private DNS](https://docs.netbird.io/how-to/manage-dns-in-your-network) | ✓ [Traffic events](https://docs.netbird.io/manage/activity/traffic-events-logging) | ✓ [IdP groups sync with JWT](https://docs.netbird.io/manage/team/idp-sync) | ✓ [Android](https://docs.netbird.io/get-started/install/android) |
-| ✓ [Domain-based DNS routes](https://docs.netbird.io/manage/dns/dns-aliases-for-routed-networks) | ✓ [Custom DNS zones](https://docs.netbird.io/manage/dns/custom-zones) | ✓ [Device posture checks](https://docs.netbird.io/how-to/manage-posture-checks) | ✓ [Terraform provider](https://registry.terraform.io/providers/netbirdio/netbird/latest) | ✓ [Android TV](https://docs.netbird.io/get-started/install/android-tv) |
-| ✓ [Exit nodes](https://docs.netbird.io/manage/network-routes/use-cases/exit-nodes) | ✓ [Multiuser support](https://docs.netbird.io/how-to/add-users-to-your-network) | ✓ Peer-to-peer encryption | ✓ [Ansible collection](https://github.com/netbirdio/ansible-netbird) | ✓ [iOS](https://docs.netbird.io/get-started/install/ios) |
-| ✓ [IPv6 dual-stack overlay](https://docs.netbird.io/manage/settings/ipv6) | ✓ [Multi-account profile switching](https://docs.netbird.io/client/profiles) | ✓ [SSH with central access policies](https://docs.netbird.io/manage/peers/ssh) | | ✓ [Apple TV](https://docs.netbird.io/get-started/install/tvos) |
-| ✓ [Browser SSH & RDP](https://docs.netbird.io/manage/peers/browser-client) | | ✓ [Quantum-resistance with Rosenpass](https://netbird.io/knowledge-hub/the-first-quantum-resistant-mesh-vpn) | | ✓ FreeBSD |
-| ✓ [Reverse proxy with auto-TLS](https://docs.netbird.io/manage/reverse-proxy) | | ✓ [Periodic re-authentication](https://docs.netbird.io/how-to/enforce-periodic-user-authentication) | | ✓ [pfSense](https://docs.netbird.io/get-started/install/pfsense) |
-| | | | | ✓ [OPNsense](https://docs.netbird.io/get-started/install/opnsense) |
-| | | | | ✓ [MikroTik RouterOS](https://docs.netbird.io/use-cases/homelab/client-on-mikrotik-router) |
-| | | | | ✓ OpenWRT |
-| | | | | ✓ [Synology](https://docs.netbird.io/get-started/install/synology) |
-| | | | | ✓ [TrueNAS](https://docs.netbird.io/get-started/install/truenas) |
-| | | | | ✓ [Proxmox](https://docs.netbird.io/get-started/install/proxmox-ve) |
-| | | | | ✓ [Raspberry Pi](https://docs.netbird.io/get-started/install/raspberrypi) |
-| | | | | ✓ [Serverless](https://docs.netbird.io/how-to/netbird-on-faas) |
-| | | | | ✓ [Container](https://docs.netbird.io/get-started/install/docker) |
+Die Images werden automatisch gebaut und in die GitHub Container Registry gepusht:
 
-### Quickstart with NetBird Cloud
+| Image | Inhalt |
+|---|---|
+| `ghcr.io/tim-riep/multi-proxy:<version>` | Proxy mit der Änderung aus diesem Fork |
+| `ghcr.io/tim-riep/mgmt-mux:<version>` | Multiplexer |
 
-- Download and install NetBird at [https://app.netbird.io/install](https://app.netbird.io/install).
-- Follow the steps to sign up with Google, Microsoft, GitHub or your email address.
-- Check the NetBird [admin UI](https://app.netbird.io/).
+`<version>` ist das Upstream-Release mit Suffix `-multi`, z. B. `v0.82.0-multi`. Daneben gibt es
+`latest`. Beide Images gibt es für `linux/amd64` und `linux/arm64`.
 
-### Quickstart with self-hosted NetBird
+Lokal bauen:
 
-This is the quickest way to try self-hosted NetBird. It should take around 5 minutes to get started if you already have a public domain and a VM. Follow the [Advanced guide with a custom identity provider](https://docs.netbird.io/selfhosted/selfhosted-guide#advanced-guide-with-a-custom-identity-provider) for installations with different IdPs.
-
-**Infrastructure requirements:**
-- A Linux VM with at least **1 CPU** and **2 GB** of memory.
-- The VM should be publicly accessible on TCP ports **80** and **443** and UDP port **3478**.
-- A **public domain** name pointing to the VM.
-
-**Software requirements:**
-- Docker with the Compose plugin (Compose v2 or higher). See the [Docker installation guide](https://docs.docker.com/engine/install/).
-
-**Steps**
-- Download and run the installation script:
 ```bash
-export NETBIRD_DOMAIN=netbird.example.com; curl -fsSL https://github.com/netbirdio/netbird/releases/latest/download/getting-started.sh | bash
+docker build -f multi/docker/proxy.Dockerfile -t multi-proxy .
 ```
 
-### A bit on NetBird internals
-- Every machine in the network runs the [NetBird agent](client/), which manages WireGuard.
-- Every agent connects to the [Management Service](management/), which holds network state, manages peer IPs, and distributes updates to agents.
-- Agents use ICE (via [pion/ice](https://github.com/pion/ice)) to discover connection candidates for peer-to-peer connections.
-- Candidates are discovered with the help of [STUN](https://en.wikipedia.org/wiki/STUN) servers.
-- Agents negotiate a connection through the [Signal Service](signal/), exchanging end-to-end encrypted messages with candidates.
-- When NAT traversal fails (e.g. mobile carrier-grade NAT) and a direct p2p connection isn't possible, the system falls back to a [Relay Service](relay/) and a secure WireGuard tunnel is established through it.
-
-<p float="left" align="middle">
-  <img src="https://docs.netbird.io/docs-static/img/about-netbird/high-level-dia.png" width="700" alt="NetBird high-level architecture diagram"/>
-</p>
-
-See a complete [architecture overview](https://docs.netbird.io/about-netbird/how-netbird-works#architecture) for details.
-
-### Reporting bugs and requesting features
-
-NetBird uses a discussion-first workflow. Bug reports and feature requests start in
-[Discussions](https://github.com/netbirdio/netbird/discussions), not as issues.
-
-| What you want to do | Where to go |
-| --- | --- |
-| Report a bug, regression, or unexpected behavior | [Issue Triage](https://github.com/netbirdio/netbird/discussions/new?category=issue-triage) |
-| Request a feature or share an idea | [Ideas & Feature Requests](https://github.com/netbirdio/netbird/discussions/new?category=ideas-feature-requests) |
-| Ask about setup, configuration, or self-hosting | [Q&A / Support](https://github.com/netbirdio/netbird/discussions/new?category=q-a-support) |
-| Report a security vulnerability | [Security policy](https://github.com/netbirdio/netbird/security/policy), never a public thread |
-
-Our team and maintainers triage discussions, ask follow-up questions, check for duplicates,
-and reproduce bugs. Validated reports are promoted to issues. This keeps the issue tracker a clear
-answer to one question: what is the team working on.
-
-Please search existing discussions and issues first, including closed ones. If something similar
-already exists, upvote it and add your details there instead of opening a duplicate.
-
-For bug reports, include your NetBird version, operating system, deployment type (Cloud,
-self-hosted, Kubernetes, or Docker), reproduction steps, expected and actual behavior, and a debug
-bundle where relevant:
-
-```shell
-netbird version
-netbird status -d -A
-netbird debug for 1m -A -S -U
+```bash
+docker build -t mgmt-mux multi/mux
 ```
 
-`-U` uploads the bundle and prints a file key you can paste instead of attaching the archive.
-`-A` anonymizes the output, which matters on a public thread. It masks most identifying details
-but is not full redaction, so read the bundle before posting it. Two levels are available:
+## Automatisierung
 
-| Level | How to select | What it masks |
-| --- | --- | --- |
-| `default` | `-A` / `--anonymize` | Public IP addresses, IPv6 ULA addresses, MAC addresses, and domains other than `netbird.io`, `netbird.cloud`, `netbird.selfhosted`, and `netbird.stage`. IPv4 private, CGNAT, and link-local ranges are kept |
-| `strict` | `--anonymize-level strict` (implies `-A`) | The above, plus IPv4 private, CGNAT, and link-local ranges, peer names in front of `netbird.cloud`, `netbird.selfhosted`, and `netbird.stage`, and WireGuard public keys. Labels under `netbird.io` are kept, since it only hosts infrastructure |
+**`multi-sync.yml`** läuft jeden Morgen um 04:00 UTC und lässt sich auch von Hand starten:
 
-See [collecting a debug bundle](https://docs.netbird.io/help/troubleshooting-client#debug-bundle)
-and the [CLI reference](https://docs.netbird.io/get-started/cli#debug-for) for details.
+1. Merged `upstream/main` in `main`. Bei Konflikten bricht der Lauf ab, und GitHub meldet den
+   Fehlschlag per Mail. Dieses README bleibt bei Konflikten erhalten (`.gitattributes`).
+2. Baut den Proxy und testet ihn sowie mgmt-mux, dann wird gepusht.
+3. Gibt es ein neues Upstream-Release, legt der Workflow den Tag `<release>-multi` an. Der Tag
+   enthält genau das Release plus die eigenen Commits dieses Forks und startet damit den Build.
+4. Deaktiviert die Upstream-Workflows, die in diesem Fork nicht laufen sollen.
 
-See [How to use Discussions, Issues, and Pull Requests](https://github.com/netbirdio/netbird/discussions/6075)
-for the full workflow, or [SUPPORT.md](SUPPORT.md) for a shorter version.
+**`multi-build.yml`** baut beide Images für jeden `v*-multi`-Tag. Von Hand lässt er sich mit
+beliebigem Ref starten.
 
-### Contributing
+Einmalig einzurichten ist das Secret **`SYNC_TOKEN`**. Das ist ein Fine-grained Token, nur für
+dieses Repository, mit den Rechten *Contents: Read and write* und *Workflows: Read and write*.
+Der Standard-Token von Actions reicht nicht aus. Er darf keine Upstream-Änderungen an
+`.github/workflows` pushen, und seine Pushes würden den Build nicht auslösen.
 
-Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) first. NetBird works ticket
-first, anything that changes behavior needs an issue the team has agreed on before you open a pull
-request.
+```bash
+gh secret set SYNC_TOKEN --repo tim-riep/multi-net
+```
 
-### Community projects
-- [NetBird installer script](https://github.com/physk/netbird-installer)
-- [netbird-tui](https://github.com/n0pashkov/netbird-tui) - terminal UI for managing NetBird peers, routes, and settings
-- [caddy-netbird](https://github.com/lixmal/caddy-netbird) - Caddy plugin that embeds a NetBird client for proxying HTTP and TCP/UDP traffic through NetBird networks
+## Betrieb
 
-**Note**: The `main` branch may be in an *unstable or even broken state* during development.
-For stable versions, see [releases](https://github.com/netbirdio/netbird/releases).
+`multi/mux/config.example.yaml` zeigt alle Optionen. `${VAR}` wird aus der Umgebung ersetzt,
+damit Tokens nicht in der Datei stehen müssen.
 
-### Support acknowledgement
+Proxy-Einstellungen:
 
-In November 2022, NetBird joined the [StartUpSecure program](https://www.forschung-it-sicherheit-kommunikationssysteme.de/foerderung/bekanntmachungen/startup-secure) sponsored by the Federal Ministry of Education and Research of the Federal Republic of Germany. Together with the [CISPA Helmholtz Center for Information Security](https://cispa.de/en), NetBird brings security best practices and simplicity to private networking.
+| Einstellung | Wert |
+|---|---|
+| `NB_PROXY_MANAGEMENT_ADDRESS` | `http://mgmt-mux:50051`, mit TLS am Multiplexer `https://…` |
+| `NB_PROXY_TOKEN` | gleicher Wert wie `proxy_token` des Multiplexers |
+| `NB_PROXY_ALLOW_INSECURE=true` | nur ohne TLS zwischen Proxy und Multiplexer (lokal oder im internen Netz) |
 
-![CISPA_Logo_BLACK_EN_RZ_RGB (1)](https://user-images.githubusercontent.com/700848/203091324-c6d311a0-22b5-4b05-a288-91cbc6cdcc46.png)
+Die Statusseite (`status_listen`) liefert unter `GET /status` je Management `connected`,
+`synced`, die Zahl der Services, abgelehnte Mappings und den letzten Fehler.
 
-### Acknowledgements
-We build on open source technologies like [WireGuard®](https://www.wireguard.com/), [Pion ICE](https://github.com/pion/ice), and [Rosenpass](https://rosenpass.eu). We greatly appreciate the work these projects are doing, and we'd love it if you could support them too (e.g., by starring or contributing).
+Ein vollständiges Beispiel liegt in `multi/deploy/docker-compose.yml`. Vorher
+`cp multi/deploy/mux.env.example multi/deploy/mux.env` ausführen und die Datei befüllen.
 
-### Legal
-This repository is licensed under the BSD-3-Clause license, which applies to all parts of the repository except for the directories management/, signal/ and relay/.
-Those directories are licensed under the GNU Affero General Public License version 3.0 (AGPLv3). See the respective LICENSE files inside each directory.
+## Grenzen
 
-_WireGuard_ and the _WireGuard_ logo are [registered trademarks](https://www.wireguard.com/trademark-policy/) of Jason A. Donenfeld.
- 
+- **Ein Proxy pro Multiplexer.** Eine neue Proxy-Verbindung löst die alte ab. Bei mehreren
+  Proxy-Instanzen bekommt jede ihren eigenen Multiplexer, zum Beispiel als Sidecar.
+- **Kein persistenter Zustand.** Startet der Multiplexer neu, während ein Management länger als
+  `initial_sync_timeout` nicht erreichbar ist, fehlen dessen Services im ersten Snapshot. Sie
+  kommen automatisch zurück, sobald das Management wieder erreichbar ist.
+- **Neue RPCs künftiger Upstream-Versionen** beantwortet der Multiplexer mit `Unimplemented`,
+  bis sie in `multi/mux/internal/mux/server.go` ergänzt sind. Neue Felder in den Mappings
+  werden unverändert durchgereicht.
 
+## Tests
+
+```bash
+cd multi/mux && go test -race ./...
+```
+
+Das sind Unit-Tests und ein End-to-End-Test mit zwei Fake-Managements, eines davon nur mit dem
+alten `GetMappingUpdate`. Optional gibt es einen Smoke-Test gegen ein echtes Proxy-Binary:
+
+```bash
+SMOKE_PROXY_BIN=/pfad/proxy SMOKE_CERT_DIR=/dir/mit/tls.crt+tls.key go test -run Smoke ./internal/mux/
+```
+
+## Lizenz
+
+- **Proxy (`proxy/`)** steht unter AGPL-3.0 (`proxy/LICENSE`). Wer den Proxy Nutzern übers Netz
+  anbietet, muss ihnen den Quellcode der geänderten Version anbieten (AGPL §13). Dieses öffentliche
+  Repo erfüllt das, am besten verlinkst du es in der Doku deines Dienstes. Jeder `-multi`-Tag
+  verweist auf genau den Quellcode des passenden Images.
+- **mgmt-mux** bindet nur die gRPC-Definitionen aus `shared/management/proto` ein. Diese stehen
+  unter BSD-3. Bei Weitergabe von Binaries muss der BSD-Hinweis mitgeliefert werden. Dafür liegt
+  `multi/mux/NOTICE` bei, das auch ins Image kopiert wird.
+- **Alles Übrige** steht unter den Lizenzen des Upstream-Projekts, siehe `LICENSE` und `LICENSES/`.
+- Die Namen und Logos des Upstream-Projekts sind Marken ihrer Inhaber. Dieser Fork wird nicht von
+  ihnen herausgegeben und ist nicht mit ihnen verbunden.
