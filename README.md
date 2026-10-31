@@ -122,6 +122,26 @@ Die Statusseite (`status_listen`) liefert unter `GET /status` je Management `con
 Ein vollständiges Beispiel liegt in `multi/deploy/docker-compose.yml`. Vorher
 `cp multi/deploy/mux.env.example multi/deploy/mux.env` ausführen und die Datei befüllen.
 
+## NetBird-Only-Services (Private-Modus)
+
+Mit `NB_PROXY_PRIVATE=true` am Proxy bieten die Managements **NetBird-Only Access** an. Solche
+Services sind nur für verbundene Peers erreichbar, und der Proxy lauscht dafür zusätzlich im
+Tunnel jedes Accounts. Der öffentliche Listener bleibt unverändert. Das funktioniert auch mit
+mehreren Managements: Ein Peer kommt nur an Services seines eigenen Accounts heran.
+
+Derselbe Modus schaltet im Dashboard aber auch **„Proxy Cluster“-Ziele** und die Option **direct
+upstream** frei. Dabei verbindet sich der Proxy aus dem Netz seines eigenen Hosts mit dem Ziel. Auf
+einem geteilten Proxy könnte so jeder Admin jedes Managements dein Host-Netz erreichen: andere
+Container, das LAN oder den Metadaten-Dienst des Hosters. mgmt-mux lehnt solche Mappings deshalb
+ab, solange `allow_direct_upstream` nicht gesetzt ist:
+
+- Abgelehnte Mappings stehen im Log von mgmt-mux und unter `/status` als `rejected_mappings`. Im
+  Dashboard erscheint der Service trotzdem als angelegt.
+- Wird ein bestehender Service auf ein solches Ziel umgestellt, nimmt mgmt-mux ihn vom Proxy,
+  statt die alte Version weiterlaufen zu lassen.
+- Als zweite Sicherung am Proxy: `NB_PROXY_DIRECT_UPSTREAM_BLOCK_PRIVATE=true`. Damit lehnt der
+  Proxy selbst alle Direktverbindungen zu nicht-öffentlichen Adressen ab.
+
 ## Grenzen
 
 - **Ein Proxy pro Multiplexer.** Eine neue Proxy-Verbindung löst die alte ab. Bei mehreren

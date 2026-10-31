@@ -364,6 +364,7 @@ managements:
 `))
 	require.NoError(t, err)
 	assert.Equal(t, 10*time.Second, cfg.InitialSyncTimeout)
+	assert.False(t, cfg.AllowDirectUpstream, "direct upstream is off unless enabled")
 	assert.Equal(t, "secret-a", cfg.Managements[0].Token)
 	assert.Equal(t, "https://a.example.com:443", cfg.Managements[0].PeerURL)
 	assert.Equal(t, "https://b.example.com:443", cfg.Managements[1].PeerURL)
@@ -377,4 +378,56 @@ managements:
 		_, err := ParseConfig([]byte(raw))
 		assert.Error(t, err, name)
 	}
+}
+
+func directUpstream(m *proto.ProxyMapping) *proto.ProxyMapping {
+	m.Path = []*proto.PathMapping{{Path: "/", Target: "http://10.0.0.5:80", Options: &proto.PathTargetOptions{DirectUpstream: true}}}
+	return m
+}
+
+func privateMapping(m *proto.ProxyMapping) *proto.ProxyMapping {
+	m.Private = true
+	return m
+}
+
+func TestDirectUpstreamRejectedByDefault(t *testing.T) {
+	h := newTestHub(t, "a")
+	syncAll(t, h, "a",
+		mapping("s1", "acc-a", "one.example.com"),
+		privateMapping(mapping("s2", "acc-a", "two.example.com")),
+		directUpstream(mapping("s3", "acc-a", "three.example.com")),
+	)
+	ch := startSession(t, h)
+	b := next(t, ch)
+	assert.Equal(t, map[string]proto.ProxyMappingUpdateType{
+		"s1": proto.ProxyMappingUpdateType_UPDATE_TYPE_CREATED,
+		"s2": proto.ProxyMappingUpdateType_UPDATE_TYPE_CREATED,
+	}, ids(b.mappings), "NetBird-only services pass, direct upstream targets do not")
+	assert.Equal(t, 1, h.Status()[0].Rejected, "rejected mappings are reported")
+
+	// An accepted service later switched to direct upstream is withdrawn,
+	// not left running with its previous configuration.
+	changed := directUpstream(privateMapping(mapping("s2", "acc-a", "two.example.com")))
+	changed.Type = proto.ProxyMappingUpdateType_UPDATE_TYPE_MODIFIED
+	h.ApplyBatch("a", []*proto.ProxyMapping{changed}, false)
+	b = next(t, ch)
+	assert.Equal(t, map[string]proto.ProxyMappingUpdateType{
+		"s2": proto.ProxyMappingUpdateType_UPDATE_TYPE_REMOVED,
+	}, ids(b.mappings), "switching to direct upstream removes the service")
+}
+
+func TestDirectUpstreamAllowed(t *testing.T) {
+	h := newTestHub(t, "a")
+	h.allowDirectUpstream = true
+	syncAll(t, h, "a", directUpstream(mapping("s3", "acc-a", "three.example.com")))
+	b := next(t, startSession(t, h))
+	assert.Len(t, b.mappings, 1, "allow_direct_upstream passes direct upstream targets through")
+}
+
+func TestPrivateCapabilityPassedThrough(t *testing.T) {
+	on := true
+	h := newTestHub(t, "a")
+	h.SetProxyInit(&proto.SyncMappingsInit{ProxyId: "p", Capabilities: &proto.ProxyCapabilities{Private: &on}})
+	got, _, _ := h.ProxyInit()
+	assert.True(t, got.GetCapabilities().GetPrivate(), "managements see the proxy's private mode")
 }

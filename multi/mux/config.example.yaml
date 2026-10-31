@@ -15,6 +15,12 @@ status_listen: 0.0.0.0:8081
 # How long the first snapshot to the proxy waits for all managements.
 initial_sync_timeout: 30s
 
+# Direct upstream and proxy cluster targets make the proxy dial from its own
+# host network (only offered when the proxy runs with NB_PROXY_PRIVATE=true).
+# On a shared proxy every management admin could reach your host network that
+# way, so such mappings are rejected unless this is true.
+allow_direct_upstream: false
+
 # ${VAR} is replaced with the environment variable VAR.
 managements:
   - name: kunde-a
