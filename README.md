@@ -91,8 +91,11 @@ docker build -t mgmt-mux multi/mux
    starten. Ein Workflow, den Upstream neu hinzufügt, kann ein einziges Mal anlaufen, bevor er
    nach dem Push deaktiviert wird.
 
-**`multi-build.yml`** baut beide Images für jeden `v*-multi`-Tag. Von Hand lässt er sich mit
-beliebigem Ref starten.
+**`multi-build.yml`** baut beide Images für jeden `v*-multi`-Tag und für Fix-Tags wie
+`v0.82.0-multi.1`. Fix-Tags entstehen von Hand, wenn eigene Änderungen vor dem nächsten
+Upstream-Release ausgeliefert werden sollen. Sie enthalten wie die automatischen Tags das
+Upstream-Release plus die eigenen Commits. Von Hand lässt sich der Workflow mit beliebigem Ref
+starten.
 
 Einmalig einzurichten ist das Secret **`SYNC_TOKEN`**. Das ist ein Fine-grained Token, nur für
 dieses Repository, mit den Rechten *Contents: Read and write* und *Workflows: Read and write*.
