@@ -22,6 +22,8 @@ services:
       NB_PROXY_ADDRESS: ":8443"
       NB_PROXY_ACME_CERTIFICATES: "true"
       NB_PROXY_ACME_ADDRESS: ":8080"
+      # Direct upstream targets may only reach public addresses.
+      NB_PROXY_DIRECT_UPSTREAM_BLOCK_PRIVATE: "true"
     ports:
       - "443:8443"
       - "80:8080"

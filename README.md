@@ -132,15 +132,24 @@ mehreren Managements: Ein Peer kommt nur an Services seines eigenen Accounts her
 Derselbe Modus schaltet im Dashboard aber auch **„Proxy Cluster“-Ziele** und die Option **direct
 upstream** frei. Dabei verbindet sich der Proxy aus dem Netz seines eigenen Hosts mit dem Ziel. Auf
 einem geteilten Proxy könnte so jeder Admin jedes Managements dein Host-Netz erreichen: andere
-Container, das LAN oder den Metadaten-Dienst des Hosters. mgmt-mux lehnt solche Mappings deshalb
-ab, solange `allow_direct_upstream` nicht gesetzt ist:
+Container, das LAN oder den Metadaten-Dienst des Hosters. Zwei Schalter regeln das:
 
-- Abgelehnte Mappings stehen im Log von mgmt-mux und unter `/status` als `rejected_mappings`. Im
-  Dashboard erscheint der Service trotzdem als angelegt.
-- Wird ein bestehender Service auf ein solches Ziel umgestellt, nimmt mgmt-mux ihn vom Proxy,
-  statt die alte Version weiterlaufen zu lassen.
-- Als zweite Sicherung am Proxy: `NB_PROXY_DIRECT_UPSTREAM_BLOCK_PRIVATE=true`. Damit lehnt der
-  Proxy selbst alle Direktverbindungen zu nicht-öffentlichen Adressen ab.
+| Schalter | Wirkung |
+|---|---|
+| `NB_PROXY_DIRECT_UPSTREAM_BLOCK_PRIVATE=true` (Proxy) | Direktverbindungen gehen nur an öffentliche Adressen. Gesperrt sind Loopback, RFC1918, CGNAT, Link-Local (Metadaten-Dienst), Multicast und die entsprechenden IPv6-Bereiche. Geprüft wird die aufgelöste IP direkt vor dem Verbinden, damit sind auch Hostnamen und DNS-Rebinding abgedeckt. Gesperrte Anfragen beantwortet der Proxy mit 502. |
+| `allow_direct_upstream` (mgmt-mux) | Ohne diese Option lehnt mgmt-mux Mappings mit direct upstream komplett ab. Wird ein bestehender Service auf ein solches Ziel umgestellt, nimmt mgmt-mux ihn vom Proxy. Abgelehnte Mappings stehen im Log und unter `/status` als `rejected_mappings`, im Dashboard erscheint der Service trotzdem als angelegt. |
+
+**Empfehlung:**
+- **NetBird-Only und Direktziele nur ins Internet:** `NB_PROXY_PRIVATE=true` und
+  `NB_PROXY_DIRECT_UPSTREAM_BLOCK_PRIVATE=true` am Proxy, dazu `allow_direct_upstream: true` am Multiplexer.
+- **NetBird-Only ohne Direktziele:** Nur `NB_PROXY_PRIVATE=true` setzen, `allow_direct_upstream`
+  bleibt aus.
+- **`allow_direct_upstream: true` niemals ohne das Proxy-Flag.** Der Multiplexer kann nicht prüfen,
+  ob es gesetzt ist.
+
+Auch mit dem Flag bleiben die **öffentlichen** IPs deines Hosts erreichbar. Ports, die der Host
+öffentlich anbietet (zum Beispiel eine Statusseite oder SSH), sind damit auch über ein Direktziel
+erreichbar. Veröffentliche deshalb nur, was ohnehin öffentlich sein darf.
 
 ## Grenzen
 
