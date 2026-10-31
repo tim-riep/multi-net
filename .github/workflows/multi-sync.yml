@@ -91,10 +91,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh workflow list --all --json id,path,state \
+          gh workflow list --repo "$GITHUB_REPOSITORY" --all --json id,path,state \
             -q '.[] | select(.state == "active") | select(.path | test("^\\.github/workflows/multi-") | not) | .id' |
           while read -r id; do
-            gh workflow disable "$id"
+            gh workflow disable --repo "$GITHUB_REPOSITORY" "$id"
           done
 
       - name: Push
@@ -131,8 +131,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh workflow list --all --json id,path,state \
+          gh workflow list --repo "$GITHUB_REPOSITORY" --all --json id,path,state \
             -q '.[] | select(.state == "active") | select(.path | test("^\\.github/workflows/multi-") | not) | .id' |
           while read -r id; do
-            gh workflow disable "$id"
+            gh workflow disable --repo "$GITHUB_REPOSITORY" "$id"
           done
