@@ -30,9 +30,13 @@ Internet ──► Proxy ───► │  mgmt-mux    │ ───────
 - **Mappings:** mgmt-mux hält zu jedem Management einen eigenen `SyncMappings`-Stream (Fallback
   `GetMappingUpdate`) mit dessen Proxy-Token und führt alle Services zu einem Gesamtzustand
   zusammen. Der Proxy bekommt einen gemeinsamen Snapshot und danach nur noch Änderungen.
-- **Resync eines Managements:** Nach einem Reconnect berechnet mgmt-mux selbst, was sich geändert
-  hat. Entfernt werden nur Services *dieses* Managements, unveränderte Services werden nicht neu
-  gesendet.
+- **Resync eines Managements:** Nach einem Reconnect berechnet mgmt-mux selbst, was weggefallen
+  ist, und entfernt nur Services *dieses* Managements. Die übrigen Services gehen wie beim
+  Original erneut als `CREATED` an den Proxy, jeweils mit frischem Einmal-Token.
+- **Neustart des Proxys:** Jede neue Proxy-Verbindung löst bei allen Managements einen frischen
+  Snapshot aus. Erst wenn alle geantwortet haben (höchstens `initial_sync_timeout`), bekommt der
+  Proxy seinen Gesamtstand. Er erhält also nie Einmal-Tokens, die schon verbraucht oder abgelaufen
+  sind.
 - **Ausfall eines Managements:** Dessen Services bleiben aktiv, bis es wieder synchronisiert ist.
 - **Routing:** Jeder Aufruf wird über `account_id` bzw. die Domain dem richtigen Management
   zugeordnet. Das gilt für `Authenticate`, `SendAccessLog`, `SendStatusUpdate`, `CreateProxyPeer`,
@@ -122,9 +126,12 @@ Ein vollständiges Beispiel liegt in `multi/deploy/docker-compose.yml`. Vorher
 
 - **Ein Proxy pro Multiplexer.** Eine neue Proxy-Verbindung löst die alte ab. Bei mehreren
   Proxy-Instanzen bekommt jede ihren eigenen Multiplexer, zum Beispiel als Sidecar.
-- **Kein persistenter Zustand.** Startet der Multiplexer neu, während ein Management länger als
-  `initial_sync_timeout` nicht erreichbar ist, fehlen dessen Services im ersten Snapshot. Sie
-  kommen automatisch zurück, sobald das Management wieder erreichbar ist.
+- **Nicht erreichbares Management beim (Neu-)Verbinden des Proxys:** Antwortet ein Management nicht
+  innerhalb von `initial_sync_timeout`, bekommt der Proxy dessen zwischengespeicherte Mappings,
+  sofern es welche gibt. Deren Einmal-Tokens sind womöglich verbraucht. Nach einem echten Neustart
+  des Proxys können diese Services deshalb erst wieder angelegt werden, wenn das Management
+  zurück ist. Das passiert dann automatisch. Nach einem Neustart des Multiplexers fehlen die
+  Services eines solchen Managements ganz, bis es erreichbar ist.
 - **Neue RPCs künftiger Upstream-Versionen** beantwortet der Multiplexer mit `Unimplemented`,
   bis sie in `multi/mux/internal/mux/server.go` ergänzt sind. Neue Felder in den Mappings
   werden unverändert durchgereicht.

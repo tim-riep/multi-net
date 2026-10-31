@@ -2,6 +2,7 @@ package mux
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"sync"
 	"testing"
@@ -15,6 +16,8 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	gproto "google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/netbirdio/netbird/shared/management/proto"
 )
@@ -26,7 +29,12 @@ type fakeMgmt struct {
 
 	snapshot []*proto.ProxyMapping
 	legacy   bool
-	push     chan *proto.ProxyMapping
+	// oneTime mimics management: every snapshot carries fresh one-time
+	// auth tokens that CreateProxyPeer consumes.
+	oneTime bool
+	issued  map[string]bool
+	tokenN  int
+	push    chan *proto.ProxyMapping
 
 	mu       sync.Mutex
 	tokens   []string
@@ -68,7 +76,7 @@ func (f *fakeMgmt) SyncMappings(stream proto.ProxyService_SyncMappingsServer) er
 		}
 		return nil
 	}
-	if err := send(&proto.SyncMappingsResponse{Mapping: f.snapshot, InitialSyncComplete: true}); err != nil {
+	if err := send(&proto.SyncMappingsResponse{Mapping: f.snapshotMappings(), InitialSyncComplete: true}); err != nil {
 		return err
 	}
 	for {
@@ -88,7 +96,7 @@ func (f *fakeMgmt) GetMappingUpdate(req *proto.GetMappingUpdateRequest, stream p
 	f.mu.Lock()
 	f.inits = append(f.inits, req.GetAddress())
 	f.mu.Unlock()
-	if err := stream.Send(&proto.GetMappingUpdateResponse{Mapping: f.snapshot, InitialSyncComplete: true}); err != nil {
+	if err := stream.Send(&proto.GetMappingUpdateResponse{Mapping: f.snapshotMappings(), InitialSyncComplete: true}); err != nil {
 		return err
 	}
 	for {
@@ -111,11 +119,37 @@ func (f *fakeMgmt) Authenticate(ctx context.Context, req *proto.AuthenticateRequ
 	return &proto.AuthenticateResponse{Success: true}, nil
 }
 
+func (f *fakeMgmt) snapshotMappings() []*proto.ProxyMapping {
+	if !f.oneTime {
+		return f.snapshot
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.issued == nil {
+		f.issued = make(map[string]bool)
+	}
+	out := make([]*proto.ProxyMapping, 0, len(f.snapshot))
+	for _, m := range f.snapshot {
+		c := gproto.Clone(m).(*proto.ProxyMapping)
+		f.tokenN++
+		c.AuthToken = fmt.Sprintf("otp-%d", f.tokenN)
+		f.issued[c.AuthToken] = true
+		out = append(out, c)
+	}
+	return out
+}
+
 func (f *fakeMgmt) CreateProxyPeer(ctx context.Context, req *proto.CreateProxyPeerRequest) (*proto.CreateProxyPeerResponse, error) {
 	f.record(ctx)
 	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.peerReqs = append(f.peerReqs, req)
-	f.mu.Unlock()
+	if f.oneTime {
+		if !f.issued[req.GetToken()] {
+			return nil, status.Error(codes.Unauthenticated, "token validation: invalid token")
+		}
+		delete(f.issued, req.GetToken())
+	}
 	return &proto.CreateProxyPeerResponse{Success: true}, nil
 }
 
@@ -271,4 +305,75 @@ func TestEndToEnd(t *testing.T) {
 	// Wrong proxy token is rejected.
 	_, err = dialMux(t, cfg.Listen, "wrong").Authenticate(ctx, &proto.AuthenticateRequest{AccountId: "acc-b"})
 	assert.Equal(t, codes.Unauthenticated, status.Code(err))
+}
+
+// proxySession connects like a (re)started proxy, acks the snapshot and
+// creates a peer for every mapping with the token it carries.
+func proxySession(t *testing.T, client proto.ProxyServiceClient, startedAt int64) []error {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream, err := client.SyncMappings(ctx)
+	require.NoError(t, err)
+	require.NoError(t, stream.Send(&proto.SyncMappingsRequest{Msg: &proto.SyncMappingsRequest_Init{
+		Init: &proto.SyncMappingsInit{ProxyId: "proxy-1", Address: "proxy.example.com", StartedAt: timestamppb.New(time.Unix(startedAt, 0))},
+	}}))
+	var mappings []*proto.ProxyMapping
+	for {
+		msg, err := stream.Recv()
+		require.NoError(t, err)
+		require.NoError(t, stream.Send(&proto.SyncMappingsRequest{Msg: &proto.SyncMappingsRequest_Ack{Ack: &proto.SyncMappingsAck{}}}))
+		mappings = append(mappings, msg.GetMapping()...)
+		if msg.GetInitialSyncComplete() {
+			break
+		}
+	}
+	var errs []error
+	for _, m := range mappings {
+		_, err := client.CreateProxyPeer(ctx, &proto.CreateProxyPeerRequest{ServiceId: m.GetId(), AccountId: m.GetAccountId(), Token: m.GetAuthToken()})
+		errs = append(errs, err)
+	}
+	require.Len(t, errs, len(mappings))
+	return errs
+}
+
+func TestProxyReconnectGetsFreshTokens(t *testing.T) {
+	a := &fakeMgmt{
+		snapshot: []*proto.ProxyMapping{mapping("svc-a1", "acc-a", "app.kunde-a.de")},
+		oneTime:  true,
+		push:     make(chan *proto.ProxyMapping),
+	}
+	b := &fakeMgmt{
+		snapshot: []*proto.ProxyMapping{mapping("svc-b1", "acc-b", "app.kunde-b.de")},
+		oneTime:  true,
+		push:     make(chan *proto.ProxyMapping),
+	}
+	cfg := &Config{
+		Listen:             freeAddr(t),
+		InitialSyncTimeout: 5 * time.Second,
+		Managements: []Management{
+			{Name: "a", Address: serveFake(t, a), Token: "token-a", PeerURL: "https://a"},
+			{Name: "b", Address: serveFake(t, b), Token: "token-b", PeerURL: "https://b"},
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- Run(ctx, cfg, log.NewEntry(log.StandardLogger())) }()
+	t.Cleanup(func() {
+		cancel()
+		<-runDone
+	})
+	client := dialMux(t, cfg.Listen, "")
+	require.Eventually(t, func() bool {
+		_, err := client.Authenticate(context.Background(), &proto.AuthenticateRequest{})
+		return status.Code(err) != codes.Unavailable
+	}, 3*time.Second, 50*time.Millisecond)
+
+	// First start, a restart of only the proxy, and a plain reconnect with
+	// the same identity must all receive tokens management still accepts.
+	for i, startedAt := range []int64{1000, 2000, 2000} {
+		for j, err := range proxySession(t, client, startedAt) {
+			assert.NoError(t, err, "session %d, mapping %d", i+1, j)
+		}
+	}
 }
