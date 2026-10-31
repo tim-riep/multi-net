@@ -1,12 +1,14 @@
 # Builds and pushes the images for a "<release>-multi" tag to GHCR:
 #   ghcr.io/<owner>/multi-proxy:<tag>  and  ghcr.io/<owner>/mgmt-mux:<tag>
-# Runs on tag push (created by multi-sync.yml) or manually for any ref.
+# Runs on tag push (created by multi-sync.yml), on fix tags such as
+# "<release>-multi.1" pushed by hand, or manually for any ref.
 name: multi - build images
 
 on:
   push:
     tags:
       - "v*-multi"
+      - "v*-multi.*"
   workflow_dispatch:
     inputs:
       ref:
