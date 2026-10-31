@@ -1,3 +1,7 @@
+> **multi-net fork:** This fork lets one reverse proxy serve several management servers.
+> See [`multi/README.md`](multi/README.md). The proxy change (AGPL-3.0) is limited to
+> `proxy/internal/roundtrip/netbird.go`; everything else is upstream NetBird.
+
 
 <div align="center">
   <p align="center">

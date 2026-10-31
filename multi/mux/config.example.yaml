@@ -1,0 +1,28 @@
+# gRPC address the proxy connects to (proxy: --mgmt=http://<listen>).
+listen: 0.0.0.0:50051
+
+# Token the proxy must send (proxy: NB_PROXY_TOKEN). Strongly recommended
+# whenever listen is reachable beyond localhost.
+proxy_token: ${NB_PROXY_TOKEN}
+
+# Optional TLS for the proxy-facing port (proxy then uses --mgmt=https://...).
+# tls_cert_file: /certs/mux.crt
+# tls_key_file: /certs/mux.key
+
+# Optional JSON status page: GET http://<status_listen>/status
+status_listen: 0.0.0.0:8081
+
+# How long the first snapshot to the proxy waits for all managements.
+initial_sync_timeout: 30s
+
+# ${VAR} is replaced with the environment variable VAR.
+managements:
+  - name: kunde-a
+    address: https://netbird.kunde-a.de:443
+    token: ${TOKEN_KUNDE_A}
+    # URL the proxy's embedded clients use for this management's accounts.
+    # Defaults to address.
+    # peer_url: https://netbird.kunde-a.de:443
+  - name: kunde-b
+    address: https://netbird.kunde-b.de:443
+    token: ${TOKEN_KUNDE_B}
