@@ -81,7 +81,7 @@ jobs:
       - name: Test
         if: steps.merge.outputs.changed == 'true'
         run: |
-          go build ./proxy/cmd/proxy
+          go build -o /dev/null ./proxy/cmd/proxy
           go test ./proxy/internal/roundtrip/
           (cd multi/mux && go test -race ./...)
 
